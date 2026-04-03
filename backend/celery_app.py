@@ -12,6 +12,7 @@ celery = Celery(
     "benchmark",
     broker=REDIS_URL,
     backend=REDIS_URL,
+    include=["tasks"]
 )
 
 celery.conf.update(
