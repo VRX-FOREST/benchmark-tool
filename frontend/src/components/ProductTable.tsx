@@ -9,7 +9,6 @@ import {
   flexRender,
   createColumnHelper,
   SortingState,
-  ColumnFiltersState,
 } from "@tanstack/react-table";
 
 interface Props {
@@ -17,11 +16,46 @@ interface Props {
   criteria: any[];
 }
 
+/**
+ * Cherche une valeur dans product.data en essayant plusieurs formats de clé.
+ * L'IA peut retourner les clés sous différentes formes :
+ *   - "Généralités > Prix (€)"
+ *   - "Prix (€)"
+ *   - "Prix"
+ * Cette fonction essaie toutes les variantes.
+ */
+function findValue(data: Record<string, any>, category: string, fieldName: string, unit: string): any {
+  if (!data) return null;
+
+  // Format 1 : "Catégorie > Nom (unité)" — le format actuel de l'IA
+  const keyWithCatAndUnit = unit
+    ? `${category} > ${fieldName} (${unit})`
+    : `${category} > ${fieldName}`;
+  if (data[keyWithCatAndUnit] !== undefined) return data[keyWithCatAndUnit];
+
+  // Format 2 : "Nom (unité)" — sans catégorie
+  const keyWithUnit = unit ? `${fieldName} (${unit})` : fieldName;
+  if (data[keyWithUnit] !== undefined) return data[keyWithUnit];
+
+  // Format 3 : "Nom" — juste le nom du champ
+  if (data[fieldName] !== undefined) return data[fieldName];
+
+  // Format 4 : "Catégorie > Nom" — avec catégorie mais sans unité
+  const keyWithCat = `${category} > ${fieldName}`;
+  if (data[keyWithCat] !== undefined) return data[keyWithCat];
+
+  // Format 5 : recherche partielle (dernier recours)
+  for (const key of Object.keys(data)) {
+    if (key.includes(fieldName)) return data[key];
+  }
+
+  return null;
+}
+
 export default function ProductTable({ products, criteria }: Props) {
   const [sorting, setSorting] = useState<SortingState>([]);
   const [globalFilter, setGlobalFilter] = useState("");
   const [selectedCategory, setSelectedCategory] = useState("all");
-  const [expandedProduct, setExpandedProduct] = useState<string | null>(null);
 
   // Construire la liste des catégories pour le filtre
   const categories = useMemo(() => {
@@ -129,25 +163,25 @@ export default function ProductTable({ products, criteria }: Props) {
       })
     );
 
-    // Colonnes dynamiques par critère
+    // Colonnes dynamiques par critère — CORRIGÉ : utilise findValue()
     for (const category of criteria) {
       if (selectedCategory !== "all" && category.category !== selectedCategory) continue;
 
       for (const field of category.fields || []) {
-        const fieldKey = field.name;
+        const fieldName = field.name;
+        const fieldUnit = field.unit || "";
+        const categoryName = category.category;
+
         cols.push(
           columnHelper.accessor(
-            (row) => {
-              const val = row.data?.[fieldKey];
-              return val !== null && val !== undefined ? val : null;
-            },
+            (row) => findValue(row.data, categoryName, fieldName, fieldUnit),
             {
-              id: `${category.category}__${fieldKey}`,
+              id: `${categoryName}__${fieldName}`,
               header: () => (
                 <div>
-                  <div className="text-xs font-semibold">{fieldKey}</div>
-                  {field.unit && (
-                    <div className="text-[10px] text-surface-400 font-normal">{field.unit}</div>
+                  <div className="text-xs font-semibold">{fieldName}</div>
+                  {fieldUnit && (
+                    <div className="text-[10px] text-surface-400 font-normal">{fieldUnit}</div>
                   )}
                 </div>
               ),
@@ -158,16 +192,21 @@ export default function ProductTable({ products, criteria }: Props) {
                 }
                 if (typeof val === "boolean") {
                   return val ? (
-                    <span className="text-green-600 font-medium">Oui</span>
+                    <span className="text-green-600 font-medium">✓ Oui</span>
                   ) : (
-                    <span className="text-red-500">Non</span>
+                    <span className="text-red-500">✗ Non</span>
+                  );
+                }
+                if (typeof val === "number") {
+                  return (
+                    <span className="text-sm text-surface-800 font-mono">
+                      {val.toLocaleString("fr-FR")}
+                      {fieldUnit && <span className="text-surface-400 ml-1 font-sans text-xs">{fieldUnit}</span>}
+                    </span>
                   );
                 }
                 return (
-                  <span className="text-sm text-surface-800">
-                    {String(val)}
-                    {field.unit && <span className="text-surface-400 ml-0.5">{field.unit}</span>}
-                  </span>
+                  <span className="text-sm text-surface-800">{String(val)}</span>
                 );
               },
               enableSorting: true,
@@ -190,6 +229,14 @@ export default function ProductTable({ products, criteria }: Props) {
     getSortedRowModel: getSortedRowModel(),
     getFilteredRowModel: getFilteredRowModel(),
   });
+
+  if (!products.length) {
+    return (
+      <div className="card p-12 text-center">
+        <p className="text-surface-500">Aucun produit collecté.</p>
+      </div>
+    );
+  }
 
   return (
     <div>
