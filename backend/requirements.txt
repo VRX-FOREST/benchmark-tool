@@ -2,7 +2,7 @@ fastapi==0.115.0
 uvicorn==0.30.0
 celery[redis]==5.4.0
 redis==5.0.0
-openai==1.50.0
+openai
 langgraph
 langchain-openai
 langchain-core
