@@ -15,3 +15,4 @@ COPY . .
 
 # Démarrer le worker Celery (pas le serveur web)
 CMD ["celery", "-A", "celery_app:celery", "worker", "--loglevel=info", "--concurrency=2"]
+# On réveille Railway
