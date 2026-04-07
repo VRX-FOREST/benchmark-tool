@@ -1,9 +1,15 @@
 """
-agent.py — Agent IA Deep Research pour le benchmark de produits.
+agent.py — Agent IA Deep Research V3.
 
-Philosophie : la qualité prime sur la vitesse.
-L'agent procède en plusieurs passes, croise les sources, et ne laisse
-aucun champ vide sans avoir épuisé toutes les options de recherche.
+Trois agents spécialisés :
+1. Agent MARCHÉ : analyse le paysage concurrentiel
+2. Agent CRITÈRES : sélectionne les critères pertinents (pas de doublons, adaptés au produit)
+3. Agent EXTRACTION : extrait et structure les données depuis le texte brut
+
+Règles absolues :
+- Chaque produit DOIT avoir une photo et un lien source
+- Les critères sont adaptés à la typologie de produit (pas de liste générique)
+- Aucune donnée inventée — null si introuvable
 """
 import os
 import json
@@ -14,7 +20,6 @@ MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 
 
 def _call_openai(system_prompt: str, user_prompt: str, expect_json: bool = True) -> dict | str:
-    """Appel générique à l'API OpenAI."""
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
@@ -31,203 +36,273 @@ def _call_openai(system_prompt: str, user_prompt: str, expect_json: bool = True)
     return content
 
 
-# ─────────────────────────────────────────────
-# PHASE 2 : SÉLECTION DES PRODUITS (Deep)
-# ─────────────────────────────────────────────
+# ══════════════════════════════════════════════
+# AGENT 1 : ANALYSE DU MARCHÉ
+# ══════════════════════════════════════════════
 
 def research_market_landscape(product_type: str, config: dict) -> dict:
-    """
-    Étape préliminaire : comprendre le marché avant de sélectionner.
-    L'IA analyse la catégorie pour identifier les segments, les marques clés,
-    et les critères d'achat principaux.
-    """
     market = config.get("market", "France")
 
-    system_prompt = f"""Tu es un analyste de marché expert, spécialisé sur le marché {market}.
-On te demande une analyse préliminaire d'une catégorie de produit AVANT de sélectionner 
-des produits pour un benchmark comparatif.
+    system_prompt = f"""Tu es un analyste de marché expert sur le marché {market}.
+Analyse cette catégorie de produit pour préparer un benchmark professionnel.
 
 Réponds en JSON :
 {{
-  "market_overview": "Description courte du marché (3-4 phrases)",
+  "market_overview": "Description du marché (3-4 phrases)",
+  "product_nature": "Description technique : de quoi est fait ce produit, comment fonctionne-t-il, à quoi sert-il (3-4 phrases)",
   "segments": [
     {{
-      "name": "Nom du segment (ex: entrée de gamme, premium, professionnel)",
-      "price_range": "fourchette de prix en €",
+      "name": "nom du segment",
+      "price_range": "XX - XX €",
       "key_brands": ["marque1", "marque2"],
       "description": "description courte"
     }}
   ],
-  "key_purchase_criteria": ["critère 1", "critère 2"],
+  "key_purchase_criteria": ["critère d'achat 1", "critère d'achat 2"],
+  "technical_differentiators": ["ce qui différencie techniquement les produits entre eux"],
   "leading_brands": [
     {{
       "name": "Marque",
-      "position": "leader | challenger | niche | entrée de gamme",
-      "strengths": "points forts en 1 phrase"
+      "position": "leader | challenger | niche",
+      "known_models": ["modèle 1", "modèle 2"],
+      "strengths": "points forts"
     }}
   ],
   "reference_websites_france": ["site1.com", "site2.com"]
 }}"""
 
-    user_prompt = f"""Analyse le marché suivant : **{product_type}**
-Marché géographique : {market}
+    user_prompt = f"""Analyse le marché : **{product_type}**
+Marché : {market}
 
-Identifie tous les segments de prix, les marques incontournables,
-et les sites de référence pour trouver des tests et avis en France."""
+Sois exhaustif sur la nature technique du produit et ce qui différencie les modèles entre eux."""
 
     return _call_openai(system_prompt, user_prompt)
 
 
 def select_products(product_type: str, config: dict, market_research: dict = None) -> list[dict]:
-    """
-    Phase 2 : Sélection des produits — version Deep Research.
-    Utilise l'analyse de marché préliminaire pour une sélection informée.
-    """
     market = config.get("market", "France")
     segment = config.get("segment", "tous")
     max_products = config.get("max_products", 10)
 
-    # Contexte de marché si disponible
     market_context = ""
     if market_research:
-        market_context = f"""
-CONTEXTE DE MARCHÉ (issu de ton analyse préliminaire) :
-- Vue d'ensemble : {market_research.get('market_overview', '')}
-- Segments identifiés : {json.dumps(market_research.get('segments', []), ensure_ascii=False)}
-- Marques leaders : {json.dumps(market_research.get('leading_brands', []), ensure_ascii=False)}
-- Sites de référence : {market_research.get('reference_websites_france', [])}
-
-Utilise ces informations pour faire une sélection EXHAUSTIVE et REPRÉSENTATIVE.
-"""
+        market_context = f"\nANALYSE DE MARCHÉ :\n{json.dumps(market_research, ensure_ascii=False, indent=2)}\n"
 
     system_prompt = f"""Tu es un expert benchmark produits pour le marché {market}.
 {market_context}
 
-Ta mission : sélectionner EXACTEMENT {max_products} produits pour un benchmark professionnel.
+Sélectionne EXACTEMENT {max_products} produits.
 
-CRITÈRES DE SÉLECTION (par ordre de priorité) :
-1. REPRÉSENTATIVITÉ : le benchmark doit couvrir TOUS les segments de prix identifiés
-2. DISPONIBILITÉ : chaque produit DOIT être actuellement en vente en {market}
-   (vérifiable sur Amazon.fr, Fnac.fr, Decathlon.fr, Cdiscount, Boulanger, site officiel)
-3. POPULARITÉ : privilégier les produits avec beaucoup d'avis (best-sellers)
-4. PERTINENCE : chaque produit doit être un concurrent direct des autres
-5. DIVERSITÉ DES MARQUES : couvrir les leaders ET les challengers
-6. Si une marque domine le marché avec plusieurs modèles pertinents (ex: Decathlon pour le sport),
-   inclure 2-3 de ses modèles
-
-RÈGLES STRICTES :
-- Nom de modèle EXACT et COMPLET (pas de nom générique ou approximatif)
-- Pour chaque produit, fournis 3-5 requêtes de recherche spécifiques en français
-  (une pour Amazon, une pour un site de test, une pour le site officiel, etc.)
-- Indique l'URL exacte si tu la connais (sinon laisse vide)
+RÈGLES :
+1. En vente en {market} aujourd'hui (Amazon.fr, Fnac, Decathlon, Cdiscount, Boulanger...)
+2. Nom EXACT et COMPLET (marque + modèle + variante)
+3. Couvrir TOUS les segments de prix
+4. Si une marque a plusieurs modèles importants, en inclure 2-3
+5. Pour chaque produit : 3-5 requêtes de recherche FR spécifiques
 
 Réponds en JSON :
 {{
-  "selection_rationale": "Explication de ta logique de sélection (2-3 phrases)",
   "products": [
     {{
-      "name": "Nom EXACT complet (marque + modèle + variante si pertinent)",
+      "name": "Nom EXACT (marque + modèle)",
       "brand": "Marque",
-      "segment": "entrée de gamme | milieu de gamme | premium | professionnel",
+      "segment": "entrée de gamme | milieu de gamme | premium",
       "estimated_price": 99,
-      "why_selected": "Pourquoi ce produit et pas un autre de la même marque",
+      "why_selected": "Justification",
       "search_queries": [
-        "requête recherche 1 (ex: amazon.fr NomProduit)",
-        "requête recherche 2 (ex: test NomProduit lesnumeriques)",
-        "requête recherche 3 (ex: NomProduit fiche technique)"
+        "site:amazon.fr NomExact",
+        "test NomExact avis",
+        "NomExact fiche technique"
       ],
-      "known_urls": ["https://url-si-connue.com"]
+      "known_urls": []
     }}
   ]
 }}"""
 
     price_constraint = ""
     if config.get("price_min"):
-        price_constraint += f"\n- Prix minimum : {config['price_min']} €"
+        price_constraint += f"\n- Prix min : {config['price_min']} €"
     if config.get("price_max"):
-        price_constraint += f"\n- Prix maximum : {config['price_max']} €"
+        price_constraint += f"\n- Prix max : {config['price_max']} €"
 
-    user_prompt = f"""Benchmark professionnel de : **{product_type}**
-
-Contraintes :
-- Marché : {market}
-- Segment : {segment}
-- Nombre de produits : exactement {max_products}{price_constraint}
-
-Sélectionne les {max_products} produits les plus pertinents.
-Justifie chaque choix."""
+    user_prompt = f"""Benchmark : **{product_type}**
+Marché : {market} | Segment : {segment} | Nombre : {max_products}{price_constraint}"""
 
     result = _call_openai(system_prompt, user_prompt)
     return result.get("products", [])
 
 
-# ─────────────────────────────────────────────
-# PHASE 3 : CRITÈRES DE COMPARAISON (Deep)
-# ─────────────────────────────────────────────
+# ══════════════════════════════════════════════
+# AGENT 2 : SÉLECTION DES CRITÈRES (spécialisé)
+# ══════════════════════════════════════════════
+
+CRITERIA_BANK = """
+BANQUE DE CRITÈRES DE RÉFÉRENCE.
+NE PAS TOUS LES PRENDRE. Sélectionner UNIQUEMENT ceux pertinents pour le produit concerné.
+AJOUTER des critères spécifiques au produit qui ne figurent pas dans cette banque.
+
+═══ Informations générales ═══
+- Marque (text)
+- Modèle (text)  
+- Prix (number, €)
+- Date de lancement (text)
+- Positionnement marketing (text)
+- Segment de marché (text)
+
+═══ Caractéristiques techniques ═══
+Structure produit :
+- Dimensions (text)
+- Poids (number, g ou kg)
+- Architecture du produit (text)
+Matériaux :
+- Type de matériau (text)
+- Densité ou caractéristiques physiques (text)
+- Traitements spécifiques (text)
+Technologies :
+- Technologies intégrées (text)
+- Systèmes brevetés (text)
+- Innovations techniques (text)
+Fabrication :
+- Procédé de fabrication (text)
+- Pays de fabrication (text)
+
+═══ Fonctionnalités ═══
+- Fonctions principales (text)
+- Fonctions secondaires (text)
+- Bénéfices utilisateurs annoncés (text)
+
+═══ Expérience utilisateur ═══
+- Confort (text — description factuelle)
+- Ergonomie (text — description factuelle)
+- Durabilité (text — description factuelle)
+- Facilité d'entretien (text)
+
+═══ Données marché ═══
+- Note moyenne clients (number, sur 5)
+- Nombre d'avis (number)
+- Points positifs récurrents dans les avis (text — synthèse)
+- Points négatifs récurrents dans les avis (text — synthèse)
+- Distribution (text)
+- Canaux de vente (text)
+"""
+
 
 def define_criteria(product_type: str, market_research: dict = None) -> list[dict]:
     """
-    Phase 3 : Modélisation des critères — version Deep Research.
-    S'appuie sur l'analyse de marché pour des critères vraiment pertinents.
+    Agent CRITÈRES spécialisé.
+    
+    Son travail est AUSSI IMPORTANT que la recherche elle-même.
+    Il sélectionne, adapte et complète les critères pour ce type de produit précis.
     """
     market_context = ""
     if market_research:
         market_context = f"""
-Critères d'achat identifiés par l'analyse de marché : 
-{market_research.get('key_purchase_criteria', [])}
-Intègre-les dans ta grille de critères.
+CONTEXTE DU PRODUIT (issu de l'analyse de marché) :
+- Nature du produit : {market_research.get('product_nature', '')}
+- Différenciateurs techniques entre produits : {market_research.get('technical_differentiators', [])}
+- Critères d'achat des consommateurs : {market_research.get('key_purchase_criteria', [])}
 """
 
-    system_prompt = f"""Tu es un expert en benchmark de produits physiques.
+    system_prompt = f"""Tu es un EXPERT en benchmark de produits physiques.
+Ta mission UNIQUE et CRITIQUE : construire la MEILLEURE grille de critères 
+pour comparer des **{product_type}**.
+
+{CRITERIA_BANK}
+
 {market_context}
 
-Définis les critères de comparaison pour un benchmark PROFESSIONNEL.
+PROCESSUS DE RÉFLEXION :
+1. D'abord, comprends ce qu'EST ce produit (matériaux, fonctionnement, usage)
+2. Identifie ce qui DIFFÉRENCIE les modèles entre eux
+3. Sélectionne dans la banque les critères qui S'APPLIQUENT à ce produit
+4. SUPPRIME les critères non pertinents (ex: "Autonomie batterie" pour un rouleau de massage)
+5. AJOUTE des critères SPÉCIFIQUES qui manquent dans la banque
+   Exemples :
+   - Rouleau de massage → Diamètre, Longueur, Surface (lisse/texturée), Niveau de fermeté, Vibration (oui/non)
+   - Casque audio → Réduction de bruit active, Codec audio, Autonomie, Pliable
+   - Machine à café → Type de café (capsule/grain/moulu), Pression (bars), Capacité réservoir
+6. VÉRIFIE qu'il n'y a AUCUN doublon (deux critères mesurant la même chose)
 
 RÈGLES :
-1. Entre 25 et 40 critères, répartis équitablement entre les catégories
-2. Noms COURTS (max 4 mots), PRÉCIS et NON AMBIGUS
-3. Privilégie les critères FACTUELS, MESURABLES et VÉRIFIABLES sur le web
-4. Inclus les critères que les sites de test (Les Numériques, RTings, etc.) utilisent
-5. Chaque critère doit être discriminant (permettre de différencier les produits)
-6. Ne PAS inclure de critères redondants
-
-Types de données :
-- "number" : valeur numérique (poids, prix, autonomie...)
-- "text" : texte court factuel (matériau, pays de fabrication...)
-- "boolean" : oui/non (présence d'une fonctionnalité)
-- "rating" : note sur 5
+- Entre 22 et 32 critères au total
+- Noms COURTS (max 5 mots), PRÉCIS
+- Chaque critère doit être TROUVABLE sur une fiche produit ou dans des avis en ligne
+- Types : "number" (mesurable), "text" (factuel court), "boolean" (oui/non)
+- PAS de type "rating" — les notes sont des "number" (sur 5)
 
 Réponds en JSON :
 {{
+  "criteria_rationale": "Explication de ta logique de sélection (2-3 phrases)",
+  "product_specific_additions": ["liste des critères ajoutés spécifiquement pour ce produit"],
   "criteria": [
     {{
-      "category": "Généralités",
+      "category": "Informations générales",
       "fields": [
         {{"name": "Prix", "unit": "€", "type": "number"}},
-        {{"name": "Date de sortie", "unit": "", "type": "text"}}
+        {{"name": "Marque", "unit": "", "type": "text"}}
       ]
+    }},
+    {{
+      "category": "Caractéristiques techniques",
+      "fields": [...]
+    }},
+    {{
+      "category": "Fonctionnalités",
+      "fields": [...]
+    }},
+    {{
+      "category": "Expérience utilisateur",
+      "fields": [...]
+    }},
+    {{
+      "category": "Données marché",
+      "fields": [...]
     }}
   ]
-}}
+}}"""
 
-Catégories obligatoires : Généralités, Caractéristiques techniques, 
-Fonctionnalités, Expérience utilisateur, Données marché."""
+    user_prompt = f"""Construis la grille de critères pour : **{product_type}**
 
-    user_prompt = f"Critères de comparaison professionnels pour : {product_type}"
+Rappel : ton travail sur les critères est AUSSI IMPORTANT que la collecte de données.
+Un benchmark avec de mauvais critères est un mauvais benchmark, même avec des données complètes.
+
+Réfléchis : qu'est-ce qu'un acheteur professionnel comparerait pour choisir entre ces produits ?"""
 
     result = _call_openai(system_prompt, user_prompt)
-    return result.get("criteria", [])
+
+    criteria = result.get("criteria", [])
+    rationale = result.get("criteria_rationale", "")
+    additions = result.get("product_specific_additions", [])
+    
+    if rationale:
+        print(f"  [CRITÈRES] Logique : {rationale}")
+    if additions:
+        print(f"  [CRITÈRES] Critères spécifiques ajoutés : {additions}")
+
+    # Validation : supprimer les doublons éventuels
+    seen_names = set()
+    for cat in criteria:
+        unique_fields = []
+        for field in cat.get("fields", []):
+            name_lower = field["name"].lower().strip()
+            if name_lower not in seen_names:
+                seen_names.add(name_lower)
+                unique_fields.append(field)
+            else:
+                print(f"  [CRITÈRES] Doublon supprimé : {field['name']}")
+        cat["fields"] = unique_fields
+
+    total = sum(len(c.get("fields", [])) for c in criteria)
+    print(f"  [CRITÈRES] Total : {total} critères uniques en {len(criteria)} catégories")
+
+    return criteria
 
 
-# ─────────────────────────────────────────────
-# PHASE 5 : EXTRACTION DES DONNÉES (Deep)
-# ─────────────────────────────────────────────
+# ══════════════════════════════════════════════
+# AGENT 3 : EXTRACTION DES DONNÉES
+# ══════════════════════════════════════════════
 
 def structure_scraped_data(product_name: str, raw_text: str, criteria: list[dict], sources: list[str]) -> dict:
-    """
-    Phase 5 : Extraction des données depuis le texte brut.
-    Version améliorée : passe la liste des sources pour traçabilité.
-    """
     flat_fields = []
     for cat in criteria:
         for field in cat.get("fields", []):
@@ -240,107 +315,78 @@ def structure_scraped_data(product_name: str, raw_text: str, criteria: list[dict
             })
 
     fields_description = "\n".join(
-        f'- Clé: "{f["key"]}" | Type: {f["type"]} | Unité: {f["unit"] or "aucune"}'
+        f'- Clé: "{f["key"]}" | Type: {f["type"]}' + (f' | Unité: {f["unit"]}' if f["unit"] else '')
         for f in flat_fields
     )
 
-    sources_list = "\n".join(f"- {s}" for s in sources)
+    sources_text = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(sources))
 
-    system_prompt = """Tu es un analyste produit expert. Tu extrais des données FACTUELLES 
-depuis du texte brut issu du scraping de plusieurs pages web.
+    system_prompt = """Tu es un expert en extraction de données produit.
 
-RÈGLES STRICTES :
-1. Utilise EXACTEMENT les clés fournies (copie-colle)
-2. Si la donnée n'est PAS clairement dans le texte → null
-3. JAMAIS inventer ou deviner une valeur
-4. Convertir en métrique (grammes, mm) et en euros
-5. Si plusieurs sources donnent des valeurs différentes, prends la plus récente ou la plus fiable
-6. Pour chaque valeur trouvée, note l'URL source dans le champ "sources"
+RÈGLES ABSOLUES :
+1. Clés EXACTES (copie-colle)
+2. Introuvable → null (JAMAIS inventer)
+3. Convertir en métrique / euros
+4. "text" → réponse COURTE et FACTUELLE (max 2 phrases)
+5. "number" → valeur numérique SEULE
+6. "boolean" → true / false / null
+7. Pour "Points positifs/négatifs" → synthèse factuelle des avis lus
+8. Pour chaque valeur, note l'URL source
 
 Réponds en JSON :
 {
-  "extracted": {
-    "clé exacte 1": valeur_ou_null,
-    "clé exacte 2": valeur_ou_null
-  },
-  "sources_per_field": {
-    "clé exacte 1": "url-de-la-source",
-    "clé exacte 2": "url-de-la-source"
-  },
+  "extracted": { "clé": valeur_ou_null },
+  "sources_per_field": { "clé": "URL source" },
   "completeness": 0.65
 }"""
 
     user_prompt = f"""Produit : {product_name}
 
-Sources scrappées :
-{sources_list}
+Sources :
+{sources_text}
 
-Clés à extraire (EXACTEMENT ces clés) :
+Critères (clés EXACTES) :
 {fields_description}
 
-Texte brut combiné des pages web :
-{raw_text[:12000]}"""
+═══ TEXTE BRUT ═══
+{raw_text[:15000]}"""
 
-    result = _call_openai(system_prompt, user_prompt)
-    return result
+    return _call_openai(system_prompt, user_prompt)
 
 
 def deep_extract_missing_fields(
-    product_name: str, 
-    criteria: list[dict], 
+    product_name: str,
+    criteria: list[dict],
     existing_data: dict,
     new_text: str,
     new_sources: list[str]
-) -> dict:
-    """
-    Passe d'extraction complémentaire : cherche UNIQUEMENT les champs manquants
-    dans un nouveau texte scrapé.
-    """
+) -> tuple[dict, dict]:
     missing_fields = []
     for cat in criteria:
         for field in cat.get("fields", []):
             unit_str = f" ({field['unit']})" if field.get("unit") else ""
             key = f"{cat['category']} > {field['name']}{unit_str}"
             if existing_data.get(key) is None:
-                missing_fields.append({
-                    "key": key,
-                    "type": field["type"],
-                    "unit": field.get("unit", ""),
-                })
+                missing_fields.append({"key": key, "type": field["type"]})
 
     if not missing_fields:
-        return existing_data
+        return existing_data, {}
 
-    fields_description = "\n".join(
-        f'- "{f["key"]}" (type: {f["type"]})'
-        for f in missing_fields
-    )
+    fields_description = "\n".join(f'- "{f["key"]}" ({f["type"]})' for f in missing_fields)
 
-    system_prompt = """Tu extrais des données FACTUELLES depuis du texte brut.
-On te donne UNIQUEMENT les champs qui sont encore manquants.
+    system_prompt = """Extrais UNIQUEMENT les champs manquants depuis ce nouveau texte.
+Clés EXACTES. Introuvable → null. Jamais inventer.
 
-RÈGLES :
-1. Clés EXACTES
-2. Si pas dans le texte → null
-3. Jamais inventer
-
-Réponds en JSON :
-{
-  "extracted": { "clé": valeur_ou_null },
-  "sources_per_field": { "clé": "url-source" }
-}"""
+JSON : { "extracted": { "clé": val }, "sources_per_field": { "clé": "url" } }"""
 
     user_prompt = f"""Produit : {product_name}
-
-Champs MANQUANTS à chercher :
+Champs MANQUANTS :
 {fields_description}
 
-Nouveau texte à analyser :
-{new_text[:10000]}"""
+Texte :
+{new_text[:12000]}"""
 
     result = _call_openai(system_prompt, user_prompt)
-    
-    # Fusionner avec les données existantes
     new_extracted = result.get("extracted", {})
     merged = {**existing_data}
     for key, val in new_extracted.items():
@@ -351,12 +397,10 @@ Nouveau texte à analyser :
 
 
 def enrich_product_from_knowledge(product_name: str, criteria: list[dict], existing_data: dict) -> dict:
-    """
-    DERNIER RECOURS : complète avec les connaissances de l'IA.
-    Uniquement pour les données factuelles vérifiables (specs techniques).
-    """
     missing_fields = []
     for cat in criteria:
+        if cat["category"] == "Données marché":
+            continue
         for field in cat.get("fields", []):
             unit_str = f" ({field['unit']})" if field.get("unit") else ""
             key = f"{cat['category']} > {field['name']}{unit_str}"
@@ -366,42 +410,20 @@ def enrich_product_from_knowledge(product_name: str, criteria: list[dict], exist
     if not missing_fields:
         return existing_data
 
-    # Ne demander que les données factuelles (pas les ratings ni données marché)
-    factual_fields = [f for f in missing_fields 
-                      if "Données marché" not in f["key"] 
-                      and f["type"] != "rating"]
+    fields_description = "\n".join(f'- "{f["key"]}" ({f["type"]})' for f in missing_fields)
 
-    if not factual_fields:
-        return existing_data
-
-    fields_description = "\n".join(f'- "{f["key"]}" ({f["type"]})' for f in factual_fields)
-
-    system_prompt = """Tu es un expert produit. Complète les données manquantes 
-UNIQUEMENT avec des informations FACTUELLES dont tu es CERTAIN.
-
-RÈGLES ULTRA-STRICTES :
-1. Ne fournis QUE les données que tu connais avec certitude (specs officielles du fabricant)
-2. Si tu as le moindre doute → null
-3. Clés EXACTES
-4. Mieux vaut 5 données sûres que 20 approximations
-
-Réponds en JSON :
-{
-  "enriched": { "clé": valeur_ou_null },
-  "confidence": "high | medium"
-}"""
+    system_prompt = """Complète UNIQUEMENT avec des données FACTUELLES CERTAINES (specs fabricant).
+Moindre doute → null. Clés EXACTES. Pas de données marché.
+JSON : { "enriched": { "clé": val } }"""
 
     user_prompt = f"""Produit : {product_name}
-
-Champs factuels manquants à compléter SI tu es certain :
+Champs manquants (si CERTAIN uniquement) :
 {fields_description}"""
 
     result = _call_openai(system_prompt, user_prompt)
     enriched = result.get("enriched", {})
-
     merged = {**existing_data}
     for key, val in enriched.items():
         if merged.get(key) is None and val is not None:
             merged[key] = val
-
     return merged
