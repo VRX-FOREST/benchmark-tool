@@ -22,8 +22,7 @@ celery.conf.update(
     timezone="Europe/Paris",
     enable_utc=True,
     # Timeout élevé car la collecte peut prendre plusieurs minutes
-    task_soft_time_limit=1800,  # 30 minutes
-    task_time_limit=1900,  # 31 minutes max
-    # Éviter la ré-exécution des tâches longues
-    broker_transport_options={"visibility_timeout": 3600},
+    task_soft_time_limit=14400,   # 4 heures
+    task_time_limit=18000,        # 5 heures max (marge de sécurité)
+    broker_transport_options={"visibility_timeout": 18000},
 )
