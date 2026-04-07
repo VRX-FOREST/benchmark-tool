@@ -1,33 +1,32 @@
 """
-database.py — Gestion de la base de données PostgreSQL.
-Stocke les benchmarks, produits et données collectées.
+database.py — Gestion de la base de données SQLite.
+V2 : stocke les sources par produit et par champ.
 """
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import sqlite3
 import json
 import os
+from datetime import datetime
 
-# On récupère l'URL de la base Postgres fournie par Railway
-DATABASE_URL = os.getenv("DATABASE_URL")
+DB_PATH = os.getenv("DB_PATH", "benchmarks.db")
+
 
 def get_db():
-    """Crée une connexion à la base de données PostgreSQL."""
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
     return conn
 
+
 def init_db():
-    """Crée les tables si elles n'existent pas."""
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("""
+    conn.executescript("""
         CREATE TABLE IF NOT EXISTS benchmarks (
             id TEXT PRIMARY KEY,
             product_type TEXT NOT NULL,
             status TEXT DEFAULT 'pending',
             config TEXT DEFAULT '{}',
             criteria TEXT DEFAULT '[]',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now')),
             progress_message TEXT DEFAULT '',
             progress_percent INTEGER DEFAULT 0
         );
@@ -42,7 +41,9 @@ def init_db():
             price_min REAL,
             price_max REAL,
             data TEXT DEFAULT '{}',
-            collected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            sources TEXT DEFAULT '[]',
+            sources_per_field TEXT DEFAULT '{}',
+            collected_at TEXT DEFAULT (datetime('now')),
             completeness REAL DEFAULT 0.0,
             FOREIGN KEY (benchmark_id) REFERENCES benchmarks(id)
         );
@@ -50,59 +51,47 @@ def init_db():
     conn.commit()
     conn.close()
 
+
 def create_benchmark(benchmark_id: str, product_type: str, config: dict) -> dict:
     conn = get_db()
-    cursor = conn.cursor()
-    # En PostgreSQL, on utilise %s au lieu de ? pour les variables
-    cursor.execute(
-        "INSERT INTO benchmarks (id, product_type, config) VALUES (%s, %s, %s)",
+    conn.execute(
+        "INSERT INTO benchmarks (id, product_type, config) VALUES (?, ?, ?)",
         (benchmark_id, product_type, json.dumps(config))
     )
     conn.commit()
     conn.close()
     return {"id": benchmark_id, "product_type": product_type, "status": "pending"}
 
+
 def update_benchmark_status(benchmark_id: str, status: str, message: str = "", percent: int = 0):
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute(
+    conn.execute(
         """UPDATE benchmarks 
-           SET status = %s, progress_message = %s, progress_percent = %s, updated_at = CURRENT_TIMESTAMP
-           WHERE id = %s""",
+           SET status = ?, progress_message = ?, progress_percent = ?, updated_at = datetime('now')
+           WHERE id = ?""",
         (status, message, percent, benchmark_id)
     )
     conn.commit()
     conn.close()
 
+
 def update_benchmark_criteria(benchmark_id: str, criteria: list):
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE benchmarks SET criteria = %s WHERE id = %s",
+    conn.execute(
+        "UPDATE benchmarks SET criteria = ? WHERE id = ?",
         (json.dumps(criteria), benchmark_id)
     )
     conn.commit()
     conn.close()
 
+
 def save_product(benchmark_id: str, product: dict):
     conn = get_db()
-    cursor = conn.cursor()
-    # Adaptation de "INSERT OR REPLACE" pour PostgreSQL
-    cursor.execute(
-        """INSERT INTO products 
-           (id, benchmark_id, name, brand, image_url, source_url, price_min, price_max, data, completeness)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-           ON CONFLICT (id) DO UPDATE SET
-           benchmark_id = EXCLUDED.benchmark_id,
-           name = EXCLUDED.name,
-           brand = EXCLUDED.brand,
-           image_url = EXCLUDED.image_url,
-           source_url = EXCLUDED.source_url,
-           price_min = EXCLUDED.price_min,
-           price_max = EXCLUDED.price_max,
-           data = EXCLUDED.data,
-           completeness = EXCLUDED.completeness,
-           collected_at = CURRENT_TIMESTAMP""",
+    conn.execute(
+        """INSERT OR REPLACE INTO products 
+           (id, benchmark_id, name, brand, image_url, source_url, 
+            price_min, price_max, data, sources, sources_per_field, completeness)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             product["id"],
             benchmark_id,
@@ -113,55 +102,51 @@ def save_product(benchmark_id: str, product: dict):
             product.get("price_min"),
             product.get("price_max"),
             json.dumps(product.get("data", {})),
+            json.dumps(product.get("sources", [])),
+            json.dumps(product.get("sources_per_field", {})),
             product.get("completeness", 0.0),
         )
     )
     conn.commit()
     conn.close()
 
+
 def get_benchmark(benchmark_id: str) -> dict | None:
     conn = get_db()
-    cursor = conn.cursor(cursor_factory=RealDictCursor)
-    cursor.execute("SELECT * FROM benchmarks WHERE id = %s", (benchmark_id,))
-    row = cursor.fetchone()
+    row = conn.execute("SELECT * FROM benchmarks WHERE id = ?", (benchmark_id,)).fetchone()
     if not row:
         conn.close()
         return None
 
     benchmark = dict(row)
-    # Conversion des dates en texte pour le JSON
-    if benchmark.get("created_at"): benchmark["created_at"] = str(benchmark["created_at"])
-    if benchmark.get("updated_at"): benchmark["updated_at"] = str(benchmark["updated_at"])
     benchmark["config"] = json.loads(benchmark["config"])
     benchmark["criteria"] = json.loads(benchmark["criteria"])
 
-    cursor.execute(
-        "SELECT * FROM products WHERE benchmark_id = %s ORDER BY brand, name",
+    products = conn.execute(
+        "SELECT * FROM products WHERE benchmark_id = ? ORDER BY brand, name",
         (benchmark_id,)
-    )
-    products = cursor.fetchall()
+    ).fetchall()
     benchmark["products"] = []
     for p in products:
         product = dict(p)
-        if product.get("collected_at"): product["collected_at"] = str(product["collected_at"])
         product["data"] = json.loads(product["data"])
+        # Charger les sources si la colonne existe
+        try:
+            product["sources"] = json.loads(product.get("sources", "[]") or "[]")
+            product["sources_per_field"] = json.loads(product.get("sources_per_field", "{}") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            product["sources"] = []
+            product["sources_per_field"] = {}
         benchmark["products"].append(product)
 
     conn.close()
     return benchmark
 
+
 def list_benchmarks() -> list:
     conn = get_db()
-    cursor = conn.cursor(cursor_factory=RealDictCursor)
-    cursor.execute(
+    rows = conn.execute(
         "SELECT id, product_type, status, progress_percent, created_at FROM benchmarks ORDER BY created_at DESC"
-    )
-    rows = cursor.fetchall()
+    ).fetchall()
     conn.close()
-    
-    results = []
-    for r in rows:
-        d = dict(r)
-        if d.get("created_at"): d["created_at"] = str(d["created_at"])
-        results.append(d)
-    return results
+    return [dict(r) for r in rows]
