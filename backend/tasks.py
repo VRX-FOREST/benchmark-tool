@@ -1,9 +1,8 @@
 """
-tasks.py — Deep Research Benchmark V4.
+tasks.py — Deep Research Benchmark V5.
 
-Utilise OpenAI web search comme source principale (plus de ScraperAPI).
-Le LLM cherche lui-même sur le web, interprète les résultats, et cite ses sources.
-Complété par du scraping direct gratuit sur les URLs trouvées.
+Source principale : OpenAI web search (zéro coût supplémentaire).
+Lien source et image OBLIGATOIRES pour chaque produit.
 """
 import uuid
 from celery_app import celery
@@ -20,7 +19,7 @@ from agent import (
     deep_extract_missing_fields,
     enrich_product_from_knowledge,
 )
-from scraper import deep_collect_product
+from scraper import deep_collect_product, _openai_web_search
 
 init_db()
 
@@ -35,8 +34,7 @@ def _count_completeness(data: dict, total_fields: int) -> float:
 @celery.task(bind=True, name="run_benchmark")
 def run_benchmark(self, benchmark_id: str, product_type: str, config: dict):
     """
-    Deep Research Benchmark V4.
-    Source principale : OpenAI web search (zéro coût supplémentaire).
+    Deep Research Benchmark V5.
     """
     try:
         # ─── Phase préliminaire : Analyse du marché ───
@@ -101,7 +99,7 @@ def run_benchmark(self, benchmark_id: str, product_type: str, config: dict):
 
             print(f"\n[BENCHMARK] ═══ Produit {i+1}/{total_products} : {product_name} ═══")
 
-            # ── Étape 1 : Collecte combinée (OpenAI web search + scraping direct) ──
+            # ── Étape 1 : Collecte combinée ──
             collected = deep_collect_product(product_name, brand, criteria_summary)
 
             image_url = collected["image_url"]
@@ -127,7 +125,7 @@ def run_benchmark(self, benchmark_id: str, product_type: str, config: dict):
                 except Exception as e:
                     print(f"  [EXTRACT] Erreur extraction : {e}")
 
-            # ── Étape 3 : Si complétude insuffisante, recherche complémentaire ciblée ──
+            # ── Étape 3 : Recherche complémentaire ciblée si complétude insuffisante ──
             if completeness < 0.60:
                 print(f"  [EXTRACT] Complétude faible ({completeness:.0%}), recherche complémentaire...")
 
@@ -147,9 +145,7 @@ def run_benchmark(self, benchmark_id: str, product_type: str, config: dict):
                     fields_str = ", ".join(missing_fields[:5])
                     print(f"  [EXTRACT] Recherche ciblée : {cat_name} ({len(missing_fields)} champs)")
 
-                    from scraper import openai_web_research
-                    targeted = openai_web_research(
-                        product_name,
+                    targeted = _openai_web_search(
                         f"Pour le produit {product_name} ({brand}), "
                         f"trouve spécifiquement ces informations : {fields_str}. "
                         f"Catégorie : {cat_name}. "
@@ -206,7 +202,13 @@ def run_benchmark(self, benchmark_id: str, product_type: str, config: dict):
                 price_min = product_info["estimated_price"]
                 price_max = product_info["estimated_price"]
 
-            # ── Étape 6 : Sauvegarde ──
+            # ── Étape 6 : Vérification finale lien + image ──
+            if not best_source_url:
+                print(f"  [WARNING] ⚠ Pas de lien source pour {product_name}")
+            if not image_url:
+                print(f"  [WARNING] ⚠ Pas d'image pour {product_name}")
+
+            # ── Étape 7 : Sauvegarde ──
             source_summary = [
                 {"url": s["url"], "title": s.get("title", "")}
                 for s in all_sources
