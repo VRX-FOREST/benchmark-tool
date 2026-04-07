@@ -1,16 +1,11 @@
 """
-tasks.py — Deep Research Benchmark V3.
+tasks.py — Deep Research Benchmark V4.
 
-La qualité prime sur tout. Le temps n'est PAS un critère.
-Chaque produit fait l'objet d'une collecte exhaustive :
-  - Recherche multi-stratégies (7 angles différents)
-  - Validation de chaque page (est-ce bien le produit ?)
-  - Extraction + ré-extraction sur les champs manquants
-  - Croisement des sources
-  - Image validée depuis la page produit confirmée
+Utilise OpenAI web search comme source principale (plus de ScraperAPI).
+Le LLM cherche lui-même sur le web, interprète les résultats, et cite ses sources.
+Complété par du scraping direct gratuit sur les URLs trouvées.
 """
 import uuid
-import asyncio
 from celery_app import celery
 from database import (
     init_db,
@@ -25,18 +20,9 @@ from agent import (
     deep_extract_missing_fields,
     enrich_product_from_knowledge,
 )
-from scraper import deep_search_product
+from scraper import deep_collect_product
 
 init_db()
-
-
-def _run_async(coro):
-    """Helper pour exécuter du code async dans Celery."""
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
 
 
 def _count_completeness(data: dict, total_fields: int) -> float:
@@ -46,67 +32,11 @@ def _count_completeness(data: dict, total_fields: int) -> float:
     return filled / total_fields
 
 
-def _select_best_image(pages: list[dict]) -> str:
-    """
-    Sélectionne la meilleure image produit parmi toutes les pages collectées.
-    Priorité : page produit confirmée > og:image > grande image.
-    """
-    # Priorité 1 : images des pages produit confirmées
-    for page in pages:
-        if page.get("is_product_page") and page.get("images"):
-            for img in page["images"]:
-                if img.get("priority", 99) <= 2 and img.get("url"):
-                    return img["url"]
-
-    # Priorité 2 : n'importe quelle og:image
-    for page in pages:
-        if page.get("images"):
-            for img in page["images"]:
-                if img.get("source") in ("og:image", "json-ld") and img.get("url"):
-                    return img["url"]
-
-    # Priorité 3 : première image trouvée
-    for page in pages:
-        if page.get("image_url"):
-            return page["image_url"]
-
-    return ""
-
-
-def _select_best_source_url(pages: list[dict]) -> str:
-    """
-    Sélectionne la meilleure URL source pour le produit.
-    Priorité : page produit confirmée sur site fiable.
-    """
-    priority_domains = [
-        "amazon.fr", "fnac.com", "decathlon.fr", "boulanger.com",
-        "darty.com", "cdiscount.com",
-    ]
-
-    # Priorité 1 : page produit confirmée sur site prioritaire
-    for page in pages:
-        if page.get("is_product_page"):
-            url = page.get("url", "")
-            if any(d in url for d in priority_domains):
-                return url
-
-    # Priorité 2 : n'importe quelle page produit confirmée
-    for page in pages:
-        if page.get("is_product_page"):
-            return page.get("url", "")
-
-    # Priorité 3 : première page avec du contenu
-    for page in pages:
-        if page.get("url"):
-            return page["url"]
-
-    return ""
-
-
 @celery.task(bind=True, name="run_benchmark")
 def run_benchmark(self, benchmark_id: str, product_type: str, config: dict):
     """
-    Deep Research Benchmark — qualité maximale, pas de compromis sur le temps.
+    Deep Research Benchmark V4.
+    Source principale : OpenAI web search (zéro coût supplémentaire).
     """
     try:
         # ─── Phase préliminaire : Analyse du marché ───
@@ -137,7 +67,7 @@ def run_benchmark(self, benchmark_id: str, product_type: str, config: dict):
             return
 
         for p in products:
-            print(f"[BENCHMARK]   → {p['name']} ({p.get('segment', '?')}) - {p.get('why_selected', '')}")
+            print(f"[BENCHMARK]   → {p['name']} ({p.get('segment', '?')})")
 
         # ─── Phase 3 : Critères de comparaison ───
         update_benchmark_status(
@@ -150,6 +80,12 @@ def run_benchmark(self, benchmark_id: str, product_type: str, config: dict):
 
         total_fields = sum(len(cat.get("fields", [])) for cat in criteria)
         print(f"[BENCHMARK] {total_fields} critères en {len(criteria)} catégories")
+
+        # Résumé des critères pour le scraper
+        criteria_summary = ""
+        for cat in criteria:
+            field_names = [f["name"] for f in cat.get("fields", [])]
+            criteria_summary += f"{cat['category']}: {', '.join(field_names)}\n"
 
         # ─── Phase 4+5 : Collecte approfondie produit par produit ───
         for i, product_info in enumerate(products):
@@ -165,67 +101,83 @@ def run_benchmark(self, benchmark_id: str, product_type: str, config: dict):
 
             print(f"\n[BENCHMARK] ═══ Produit {i+1}/{total_products} : {product_name} ═══")
 
-            # ── Étape 1 : Collecte multi-sources ──
-            pages = _run_async(deep_search_product(product_name, brand))
+            # ── Étape 1 : Collecte combinée (OpenAI web search + scraping direct) ──
+            collected = deep_collect_product(product_name, brand, criteria_summary)
 
-            # ── Étape 2 : Sélection de la meilleure image et source ──
-            image_url = _select_best_image(pages)
-            source_url = _select_best_source_url(pages)
+            image_url = collected["image_url"]
+            best_source_url = collected["best_source_url"]
+            all_sources = collected["sources"]
+            source_urls = collected["source_urls"]
 
-            product_pages = [p for p in pages if p.get("is_product_page")]
-            other_pages = [p for p in pages if not p.get("is_product_page")]
-
-            print(f"  [COLLECT] {len(product_pages)} pages produit confirmées, "
-                  f"{len(other_pages)} autres sources")
-            print(f"  [COLLECT] Image : {'✓' if image_url else '✗'}")
-            print(f"  [COLLECT] Source : {source_url or '(aucune)'}")
-
-            # ── Étape 3 : Première extraction (toutes les sources combinées) ──
-            combined_text = ""
-            all_source_urls = []
-            for page in pages:
-                combined_text += f"\n\n══ Source: {page['url']} ({page.get('source_type', 'web')}) ══\n"
-                combined_text += page.get("text", "")
-                all_source_urls.append(page["url"])
-
+            # ── Étape 2 : Extraction des données structurées ──
             extracted_data = {}
             sources_per_field = {}
             completeness = 0.0
 
-            if combined_text:
+            if collected["text"]:
+                print(f"  [EXTRACT] Extraction des données depuis {len(source_urls)} sources...")
                 try:
                     result = structure_scraped_data(
-                        product_name, combined_text, criteria, all_source_urls
+                        product_name, collected["text"], criteria, source_urls
                     )
                     extracted_data = result.get("extracted", {})
                     sources_per_field = result.get("sources_per_field", {})
                     completeness = _count_completeness(extracted_data, total_fields)
                     print(f"  [EXTRACT] Extraction 1 : {completeness:.0%} complétude")
                 except Exception as e:
-                    print(f"  [EXTRACT] Erreur extraction 1 : {e}")
+                    print(f"  [EXTRACT] Erreur extraction : {e}")
 
-            # ── Étape 4 : Si des pages produit existent mais pas encore exploitées ──
-            if completeness < 0.65 and product_pages:
-                print(f"  [EXTRACT] Ré-extraction ciblée sur les pages produit confirmées...")
-                product_text = ""
-                product_urls = []
-                for page in product_pages:
-                    product_text += f"\n\n══ Source: {page['url']} ══\n{page.get('text', '')}"
-                    product_urls.append(page["url"])
+            # ── Étape 3 : Si complétude insuffisante, recherche complémentaire ciblée ──
+            if completeness < 0.60:
+                print(f"  [EXTRACT] Complétude faible ({completeness:.0%}), recherche complémentaire...")
 
-                try:
-                    extracted_data, new_sources = deep_extract_missing_fields(
-                        product_name, criteria, extracted_data, product_text, product_urls
+                # Identifier les champs manquants par catégorie
+                missing_by_cat = {}
+                for cat in criteria:
+                    for field in cat.get("fields", []):
+                        unit_str = f" ({field['unit']})" if field.get("unit") else ""
+                        key = f"{cat['category']} > {field['name']}{unit_str}"
+                        if extracted_data.get(key) is None:
+                            if cat["category"] not in missing_by_cat:
+                                missing_by_cat[cat["category"]] = []
+                            missing_by_cat[cat["category"]].append(field["name"])
+
+                # Recherche ciblée sur les catégories manquantes
+                for cat_name, missing_fields in missing_by_cat.items():
+                    fields_str = ", ".join(missing_fields[:5])
+                    print(f"  [EXTRACT] Recherche ciblée : {cat_name} ({len(missing_fields)} champs)")
+
+                    from scraper import openai_web_research
+                    targeted = openai_web_research(
+                        product_name,
+                        f"Pour le produit {product_name} ({brand}), "
+                        f"trouve spécifiquement ces informations : {fields_str}. "
+                        f"Catégorie : {cat_name}. "
+                        f"Cherche sur les fiches techniques, tests, et sites marchands français. "
+                        f"Donne des valeurs PRÉCISES avec les sources."
                     )
-                    sources_per_field.update(new_sources)
-                    completeness = _count_completeness(extracted_data, total_fields)
-                    print(f"  [EXTRACT] Après ré-extraction : {completeness:.0%}")
-                except Exception as e:
-                    print(f"  [EXTRACT] Erreur ré-extraction : {e}")
 
-            # ── Étape 5 : Enrichissement IA (dernier recours) ──
-            if completeness < 0.45:
-                print(f"  [EXTRACT] Enrichissement IA (complétude basse : {completeness:.0%})...")
+                    if targeted["success"] and targeted["text"]:
+                        new_urls = [s["url"] for s in targeted["sources"]]
+                        try:
+                            extracted_data, new_field_sources = deep_extract_missing_fields(
+                                product_name, criteria, extracted_data,
+                                targeted["text"], new_urls
+                            )
+                            sources_per_field.update(new_field_sources)
+                            completeness = _count_completeness(extracted_data, total_fields)
+                            print(f"  [EXTRACT] Après recherche ciblée {cat_name} : {completeness:.0%}")
+                        except Exception as e:
+                            print(f"  [EXTRACT] Erreur extraction ciblée : {e}")
+
+                    # Ajouter les nouvelles sources
+                    for s in targeted.get("sources", []):
+                        if s["url"] not in [x["url"] for x in all_sources]:
+                            all_sources.append(s)
+
+            # ── Étape 4 : Enrichissement IA (dernier recours) ──
+            if completeness < 0.40:
+                print(f"  [EXTRACT] Enrichissement IA (complétude {completeness:.0%})...")
                 try:
                     extracted_data = enrich_product_from_knowledge(
                         product_name, criteria, extracted_data
@@ -235,7 +187,7 @@ def run_benchmark(self, benchmark_id: str, product_type: str, config: dict):
                 except Exception as e:
                     print(f"  [EXTRACT] Erreur enrichissement : {e}")
 
-            # ── Étape 6 : Extraction du prix ──
+            # ── Étape 5 : Prix ──
             price_min = None
             price_max = None
             for key, val in extracted_data.items():
@@ -254,11 +206,10 @@ def run_benchmark(self, benchmark_id: str, product_type: str, config: dict):
                 price_min = product_info["estimated_price"]
                 price_max = product_info["estimated_price"]
 
-            # ── Étape 7 : Sauvegarde ──
+            # ── Étape 6 : Sauvegarde ──
             source_summary = [
-                {"url": p["url"], "type": p.get("source_type", "web"), 
-                 "is_product_page": p.get("is_product_page", False)}
-                for p in pages
+                {"url": s["url"], "title": s.get("title", "")}
+                for s in all_sources
             ]
 
             product_data = {
@@ -266,7 +217,7 @@ def run_benchmark(self, benchmark_id: str, product_type: str, config: dict):
                 "name": product_name,
                 "brand": brand,
                 "image_url": image_url,
-                "source_url": source_url,
+                "source_url": best_source_url,
                 "price_min": price_min,
                 "price_max": price_max,
                 "data": extracted_data,
@@ -276,10 +227,12 @@ def run_benchmark(self, benchmark_id: str, product_type: str, config: dict):
             }
             save_product(benchmark_id, product_data)
 
-            print(f"  [SAVE] ✓ {product_name} sauvegardé — "
+            print(f"  [SAVE] ✓ {product_name} — "
                   f"{completeness:.0%} complétude, "
                   f"{len(source_summary)} sources, "
-                  f"prix: {price_min or '?'}€")
+                  f"prix: {price_min or '?'}€, "
+                  f"image: {'✓' if image_url else '✗'}, "
+                  f"lien: {'✓' if best_source_url else '✗'}")
 
         # ─── Terminé ───
         update_benchmark_status(
