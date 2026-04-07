@@ -21,7 +21,8 @@ from agent import (
     enrich_product_from_knowledge,
 )
 from scraper import scrape_product, search_web
-
+from database import init_db
+init_db()
 
 def _run_async(coro):
     """Helper pour exécuter du code async dans Celery."""
