@@ -1,152 +1,178 @@
 """
-database.py — Gestion de la base de données SQLite.
-V2 : stocke les sources par produit et par champ.
+database.py — Stockage des données via Redis.
+
+Pourquoi Redis et pas SQLite ?
+Sur Railway, le backend (FastAPI) et le worker (Celery) tournent dans des
+conteneurs SÉPARÉS. Ils ne partagent pas de fichier sur disque.
+En revanche, ils sont TOUS LES DEUX connectés au même service Redis.
+Redis devient donc la base de données partagée.
+
+Structure des clés Redis :
+  - benchmark:{id}          → JSON du benchmark (config, critères, statut)
+  - benchmark:{id}:products → JSON de la liste des produits
+  - benchmarks:index        → Liste ordonnée des IDs de benchmarks
 """
-import sqlite3
-import json
 import os
+import json
+import redis
 from datetime import datetime
 
-DB_PATH = os.getenv("DB_PATH", "benchmarks.db")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+_redis_client = None
 
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+def _get_redis():
+    """Connexion Redis réutilisable."""
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+    return _redis_client
 
 
 def init_db():
-    conn = get_db()
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS benchmarks (
-            id TEXT PRIMARY KEY,
-            product_type TEXT NOT NULL,
-            status TEXT DEFAULT 'pending',
-            config TEXT DEFAULT '{}',
-            criteria TEXT DEFAULT '[]',
-            created_at TEXT DEFAULT (datetime('now')),
-            updated_at TEXT DEFAULT (datetime('now')),
-            progress_message TEXT DEFAULT '',
-            progress_percent INTEGER DEFAULT 0
-        );
+    """Vérifie la connexion Redis. Pas de tables à créer."""
+    r = _get_redis()
+    r.ping()
+    print("[DB] Connexion Redis OK")
 
-        CREATE TABLE IF NOT EXISTS products (
-            id TEXT PRIMARY KEY,
-            benchmark_id TEXT NOT NULL,
-            name TEXT NOT NULL,
-            brand TEXT DEFAULT '',
-            image_url TEXT DEFAULT '',
-            source_url TEXT DEFAULT '',
-            price_min REAL,
-            price_max REAL,
-            data TEXT DEFAULT '{}',
-            sources TEXT DEFAULT '[]',
-            sources_per_field TEXT DEFAULT '{}',
-            collected_at TEXT DEFAULT (datetime('now')),
-            completeness REAL DEFAULT 0.0,
-            FOREIGN KEY (benchmark_id) REFERENCES benchmarks(id)
-        );
-    """)
-    conn.commit()
-    conn.close()
+
+# ─── BENCHMARKS ───
 
 
 def create_benchmark(benchmark_id: str, product_type: str, config: dict) -> dict:
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO benchmarks (id, product_type, config) VALUES (?, ?, ?)",
-        (benchmark_id, product_type, json.dumps(config))
-    )
-    conn.commit()
-    conn.close()
+    """Crée un nouveau benchmark."""
+    r = _get_redis()
+    now = datetime.utcnow().isoformat()
+
+    benchmark = {
+        "id": benchmark_id,
+        "product_type": product_type,
+        "status": "pending",
+        "config": config,
+        "criteria": [],
+        "created_at": now,
+        "updated_at": now,
+        "progress_message": "",
+        "progress_percent": 0,
+    }
+
+    r.set(f"benchmark:{benchmark_id}", json.dumps(benchmark))
+    r.set(f"benchmark:{benchmark_id}:products", json.dumps([]))
+
+    # Ajouter à l'index (liste ordonnée, le plus récent en premier)
+    r.lpush("benchmarks:index", benchmark_id)
+
     return {"id": benchmark_id, "product_type": product_type, "status": "pending"}
 
 
 def update_benchmark_status(benchmark_id: str, status: str, message: str = "", percent: int = 0):
-    conn = get_db()
-    conn.execute(
-        """UPDATE benchmarks 
-           SET status = ?, progress_message = ?, progress_percent = ?, updated_at = datetime('now')
-           WHERE id = ?""",
-        (status, message, percent, benchmark_id)
-    )
-    conn.commit()
-    conn.close()
+    """Met à jour le statut et la progression."""
+    r = _get_redis()
+    raw = r.get(f"benchmark:{benchmark_id}")
+    if not raw:
+        # Fallback : créer un benchmark minimal si inexistant
+        print(f"[DB] WARNING: benchmark {benchmark_id} introuvable, création d'un stub")
+        benchmark = {
+            "id": benchmark_id,
+            "product_type": "inconnu",
+            "status": status,
+            "config": {},
+            "criteria": [],
+            "created_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(),
+            "progress_message": message,
+            "progress_percent": percent,
+        }
+    else:
+        benchmark = json.loads(raw)
+
+    benchmark["status"] = status
+    benchmark["progress_message"] = message
+    benchmark["progress_percent"] = percent
+    benchmark["updated_at"] = datetime.utcnow().isoformat()
+
+    r.set(f"benchmark:{benchmark_id}", json.dumps(benchmark))
 
 
 def update_benchmark_criteria(benchmark_id: str, criteria: list):
-    conn = get_db()
-    conn.execute(
-        "UPDATE benchmarks SET criteria = ? WHERE id = ?",
-        (json.dumps(criteria), benchmark_id)
-    )
-    conn.commit()
-    conn.close()
+    """Enregistre les critères de comparaison."""
+    r = _get_redis()
+    raw = r.get(f"benchmark:{benchmark_id}")
+    if not raw:
+        return
+
+    benchmark = json.loads(raw)
+    benchmark["criteria"] = criteria
+    benchmark["updated_at"] = datetime.utcnow().isoformat()
+
+    r.set(f"benchmark:{benchmark_id}", json.dumps(benchmark))
+
+
+# ─── PRODUITS ───
 
 
 def save_product(benchmark_id: str, product: dict):
-    conn = get_db()
-    conn.execute(
-        """INSERT OR REPLACE INTO products 
-           (id, benchmark_id, name, brand, image_url, source_url, 
-            price_min, price_max, data, sources, sources_per_field, completeness)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            product["id"],
-            benchmark_id,
-            product.get("name", ""),
-            product.get("brand", ""),
-            product.get("image_url", ""),
-            product.get("source_url", ""),
-            product.get("price_min"),
-            product.get("price_max"),
-            json.dumps(product.get("data", {})),
-            json.dumps(product.get("sources", [])),
-            json.dumps(product.get("sources_per_field", {})),
-            product.get("completeness", 0.0),
-        )
-    )
-    conn.commit()
-    conn.close()
+    """Ajoute ou met à jour un produit dans un benchmark."""
+    r = _get_redis()
+
+    # Charger la liste existante
+    raw = r.get(f"benchmark:{benchmark_id}:products")
+    products = json.loads(raw) if raw else []
+
+    # Chercher si le produit existe déjà (par ID)
+    product_id = product.get("id", "")
+    found = False
+    for i, p in enumerate(products):
+        if p.get("id") == product_id:
+            products[i] = product
+            found = True
+            break
+
+    if not found:
+        products.append(product)
+
+    r.set(f"benchmark:{benchmark_id}:products", json.dumps(products))
+
+
+# ─── LECTURE ───
 
 
 def get_benchmark(benchmark_id: str) -> dict | None:
-    conn = get_db()
-    row = conn.execute("SELECT * FROM benchmarks WHERE id = ?", (benchmark_id,)).fetchone()
-    if not row:
-        conn.close()
+    """Récupère un benchmark complet avec ses produits."""
+    r = _get_redis()
+
+    raw = r.get(f"benchmark:{benchmark_id}")
+    if not raw:
         return None
 
-    benchmark = dict(row)
-    benchmark["config"] = json.loads(benchmark["config"])
-    benchmark["criteria"] = json.loads(benchmark["criteria"])
+    benchmark = json.loads(raw)
 
-    products = conn.execute(
-        "SELECT * FROM products WHERE benchmark_id = ? ORDER BY brand, name",
-        (benchmark_id,)
-    ).fetchall()
-    benchmark["products"] = []
-    for p in products:
-        product = dict(p)
-        product["data"] = json.loads(product["data"])
-        # Charger les sources si la colonne existe
-        try:
-            product["sources"] = json.loads(product.get("sources", "[]") or "[]")
-            product["sources_per_field"] = json.loads(product.get("sources_per_field", "{}") or "{}")
-        except (json.JSONDecodeError, TypeError):
-            product["sources"] = []
-            product["sources_per_field"] = {}
-        benchmark["products"].append(product)
+    # Charger les produits
+    raw_products = r.get(f"benchmark:{benchmark_id}:products")
+    benchmark["products"] = json.loads(raw_products) if raw_products else []
 
-    conn.close()
     return benchmark
 
 
 def list_benchmarks() -> list:
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT id, product_type, status, progress_percent, created_at FROM benchmarks ORDER BY created_at DESC"
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    """Liste tous les benchmarks (sans les produits)."""
+    r = _get_redis()
+
+    # Récupérer tous les IDs depuis l'index
+    benchmark_ids = r.lrange("benchmarks:index", 0, -1)
+
+    benchmarks = []
+    for bid in benchmark_ids:
+        raw = r.get(f"benchmark:{bid}")
+        if raw:
+            b = json.loads(raw)
+            benchmarks.append({
+                "id": b["id"],
+                "product_type": b.get("product_type", ""),
+                "status": b.get("status", ""),
+                "progress_percent": b.get("progress_percent", 0),
+                "created_at": b.get("created_at", ""),
+            })
+
+    return benchmarks
