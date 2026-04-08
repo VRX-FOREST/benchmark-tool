@@ -30,11 +30,11 @@ export default function SearchForm({ onSubmit }: Props) {
   };
 
   const examples = [
-    "Casques audio à réduction de bruit",
-    "Aspirateurs robots",
-    "Machines à café automatiques",
-    "Trottinettes électriques adulte",
-    "Moniteurs 27 pouces 4K",
+    "Rouleau de massage",
+    "Balle de massage",
+    "Tapis d'acupression",
+    "Chaussette de compression",
+    "Canne de massage",
   ];
 
   return (
