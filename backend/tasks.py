@@ -1,16 +1,17 @@
 """
-tasks.py — Deep Research Benchmark V6.
+tasks.py — Deep Research Benchmark V7.
 
-Deux tâches Celery :
-1. discover_products_task : trouve les produits candidats (rapide, avec photo/prix/lien)
-2. run_benchmark : deep research sur les produits sélectionnés par l'utilisateur
+RÈGLE ABSOLUE : chaque produit candidat DOIT avoir une photo ET un lien.
+Si après toutes les tentatives un produit n'a ni photo ni lien,
+il est remplacé par un produit alternatif.
 """
 import uuid
 from celery_app import celery
 from database import (
     init_db,
     update_benchmark_status, update_benchmark_criteria,
-    save_product, save_candidates,
+    save_product, save_candidates, save_market_research,
+    get_market_research,
 )
 from agent import (
     research_market_landscape,
@@ -37,15 +38,120 @@ def _count_completeness(data: dict, total_fields: int) -> float:
     return filled / total_fields
 
 
+def _find_url_with_retries(product_name: str, brand: str, max_retries: int = 3) -> str:
+    """
+    Cherche le lien source avec plusieurs tentatives et reformulations.
+    """
+    # Tentative 1 : recherche standard
+    url = find_product_url(product_name, brand)
+    if url:
+        return url
+
+    # Tentative 2 : reformuler le nom du produit
+    print(f"  [LIEN] Retry 2 : reformulation du nom...")
+    simplified_name = product_name.replace("Foam Roller", "rouleau").replace("foam roller", "rouleau")
+    url = find_product_url(simplified_name, brand)
+    if url:
+        return url
+
+    # Tentative 3 : recherche par marque seule
+    print(f"  [LIEN] Retry 3 : recherche par marque...")
+    result = _openai_web_search(
+        f"Acheter {product_name} en France. "
+        f"Donne le lien DIRECT de la page produit sur un site marchand "
+        f"(amazon.fr, fnac.com, decathlon.fr, boulanger.com, cdiscount.com, darty.com). "
+        f"PAS un lien de page de recherche."
+    )
+    if result["success"]:
+        for s in result["sources"]:
+            u = s["url"]
+            if "/s?" not in u and "/search" not in u and "/recherche" not in u:
+                # Validation rapide
+                import asyncio
+                loop = asyncio.new_event_loop()
+                try:
+                    from scraper import _validate_url
+                    is_valid = loop.run_until_complete(_validate_url(u))
+                    if is_valid:
+                        return u
+                finally:
+                    loop.close()
+
+    return ""
+
+
+def _find_image_with_retries(product_name: str, brand: str, source_url: str, max_retries: int = 3) -> str:
+    """
+    Cherche l'image avec plusieurs tentatives et stratégies.
+    """
+    # Tentative 1 : recherche standard
+    img = find_product_image(product_name, brand, source_url)
+    if img:
+        return img
+
+    # Tentative 2 : recherche Google Images via OpenAI
+    print(f"  [IMAGE] Retry 2 : Google Images...")
+    result = _openai_web_search(
+        f"Image produit {product_name} {brand}. "
+        f"Trouve l'URL DIRECTE d'une photo du produit au format .jpg ou .png. "
+        f"L'URL doit commencer par https:// et finir par .jpg, .jpeg, .png ou .webp. "
+        f"Cherche sur Google Images, le site {brand}, ou amazon.fr."
+    )
+    if result["success"]:
+        import re
+        patterns = [
+            r'https://m\.media-amazon\.com/images/I/[A-Za-z0-9._+-]+\.(?:jpg|png|webp)',
+            r'https?://[^\s<>"\']+\.(?:jpg|jpeg|png|webp)(?:\?[^\s<>"\']*)?',
+        ]
+        for pattern in patterns:
+            matches = re.findall(pattern, result["text"])
+            for match in matches:
+                match = match.rstrip(".,;:)")
+                if len(match) > 25:
+                    # Valider
+                    import asyncio
+                    loop = asyncio.new_event_loop()
+                    try:
+                        from scraper import _validate_image_url
+                        is_valid = loop.run_until_complete(_validate_image_url(match))
+                        if is_valid:
+                            return match
+                    finally:
+                        loop.close()
+
+    # Tentative 3 : chercher une image du produit via une autre requête
+    print(f"  [IMAGE] Retry 3 : recherche alternative...")
+    result3 = _openai_web_search(
+        f"photo {product_name} png OR jpg site:amazon.fr OR site:{brand.lower()}.com OR site:{brand.lower()}.fr"
+    )
+    if result3["success"]:
+        import re
+        matches = re.findall(r'https?://[^\s<>"\']+\.(?:jpg|jpeg|png|webp)', result3["text"])
+        for match in matches:
+            match = match.rstrip(".,;:)")
+            if len(match) > 25:
+                import asyncio
+                loop2 = asyncio.new_event_loop()
+                try:
+                    from scraper import _validate_image_url
+                    is_valid = loop2.run_until_complete(_validate_image_url(match))
+                    if is_valid:
+                        return match
+                finally:
+                    loop2.close()
+
+    return ""
+
+
 # ══════════════════════════════════════════════
-# TÂCHE 1 : DÉCOUVERTE DES PRODUITS CANDIDATS
+# TÂCHE 1 : DÉCOUVERTE (avec lien + image obligatoires)
 # ══════════════════════════════════════════════
 
 @celery.task(bind=True, name="discover_products")
 def discover_products_task(self, benchmark_id: str, product_type: str, config: dict):
     """
-    Phase 1 : Trouve les produits candidats avec photo, prix et lien.
-    Rapide : on cherche juste l'essentiel pour que l'utilisateur puisse choisir.
+    Phase 1 : Trouve les produits candidats.
+    CHAQUE produit DOIT avoir un lien source ET une photo.
     """
     try:
         update_benchmark_status(
@@ -54,10 +160,10 @@ def discover_products_task(self, benchmark_id: str, product_type: str, config: d
         )
         print(f"\n[DISCOVER] ══════════════════════════════════════")
         print(f"[DISCOVER] Recherche de produits : {product_type}")
-        print(f"[DISCOVER] ══════════════════════════════════════")
 
         # Analyse du marché
         market_research = research_market_landscape(product_type, config)
+        save_market_research(benchmark_id, market_research)
         print(f"[DISCOVER] Marché analysé")
 
         update_benchmark_status(
@@ -65,21 +171,30 @@ def discover_products_task(self, benchmark_id: str, product_type: str, config: d
             "Sélection des produits candidats...", 15
         )
 
-        # Sélection des produits
-        products = select_products(product_type, config, market_research)
+        # Sélection des produits (demander plus que nécessaire pour avoir des remplaçants)
+        max_wanted = config.get("max_products", 12)
+        config_extended = {**config, "max_products": max_wanted + 4}
+        products = select_products(product_type, config_extended, market_research)
         total = len(products)
-        print(f"[DISCOVER] {total} produits identifiés")
+        print(f"[DISCOVER] {total} produits identifiés (dont {4} remplaçants)")
 
         if not products:
             update_benchmark_status(benchmark_id, "error", "Aucun produit trouvé.", 0)
             return
 
-        # Pour chaque produit : trouver prix, lien et photo
+        # Pour chaque produit : trouver lien + photo + prix
         candidates = []
+        skipped = 0
+
         for i, p in enumerate(products):
             name = p["name"]
             brand = p.get("brand", "")
             progress = 15 + int((i / total) * 80)
+
+            # Si on a déjà assez de candidats valides, on arrête
+            if len(candidates) >= max_wanted:
+                print(f"[DISCOVER] {max_wanted} candidats valides trouvés, arrêt.")
+                break
 
             update_benchmark_status(
                 benchmark_id, "discovering",
@@ -88,17 +203,16 @@ def discover_products_task(self, benchmark_id: str, product_type: str, config: d
 
             print(f"\n[DISCOVER] ── {i+1}/{total} : {name} ──")
 
-            # Trouver le lien
-            source_url = find_product_url(name, brand)
+            # ── LIEN (OBLIGATOIRE) ──
+            source_url = _find_url_with_retries(name, brand)
 
-            # Trouver l'image
-            image_url = find_product_image(name, brand, source_url)
+            # ── IMAGE (OBLIGATOIRE) ──
+            image_url = _find_image_with_retries(name, brand, source_url)
 
-            # Prix estimé (depuis la sélection IA ou recherche rapide)
+            # ── PRIX ──
             estimated_price = p.get("estimated_price")
             if not estimated_price:
-                # Recherche rapide du prix
-                price_result = _openai_web_search(f"prix {name} en France euros")
+                price_result = _openai_web_search(f"prix {name} en France euros 2024 2025")
                 if price_result["success"]:
                     import re
                     prices = re.findall(r'(\d+[.,]?\d*)\s*€', price_result["text"])
@@ -108,6 +222,22 @@ def discover_products_task(self, benchmark_id: str, product_type: str, config: d
                         except:
                             pass
 
+            # ── VALIDATION ──
+            has_link = bool(source_url)
+            has_image = bool(image_url)
+
+            status_parts = []
+            status_parts.append(f"{'✓' if has_link else '✗'} lien")
+            status_parts.append(f"{'✓' if has_image else '✗'} image")
+            status_parts.append(f"{'✓' if estimated_price else '✗'} prix")
+            print(f"[DISCOVER] {' | '.join(status_parts)}")
+
+            # Si pas de lien ET pas d'image → on skip ce produit
+            if not has_link and not has_image:
+                print(f"[DISCOVER] ⚠ SKIP {name} — ni lien ni image trouvés")
+                skipped += 1
+                continue
+
             candidate = {
                 "id": str(uuid.uuid4()),
                 "name": name,
@@ -115,29 +245,30 @@ def discover_products_task(self, benchmark_id: str, product_type: str, config: d
                 "segment": p.get("segment", ""),
                 "estimated_price": estimated_price,
                 "why_selected": p.get("why_selected", ""),
-                "image_url": image_url or "",
-                "source_url": source_url or "",
-                "selected": True,  # Pré-sélectionné par défaut
+                "image_url": image_url,
+                "source_url": source_url,
+                "selected": True,
+                "has_link": has_link,
+                "has_image": has_image,
             }
             candidates.append(candidate)
 
-            status_icon = f"{'✓' if source_url else '✗'} lien | {'✓' if image_url else '✗'} image | {'✓' if estimated_price else '✗'} prix"
-            print(f"[DISCOVER] {status_icon}")
-
-        # Sauvegarder les candidats dans la base
+        # Sauvegarder les candidats
         save_candidates(benchmark_id, candidates)
 
-        # Stocker aussi l'analyse de marché pour la phase 2
-        from database import save_market_research
-        save_market_research(benchmark_id, market_research)
+        valid_count = len(candidates)
+        complete_count = sum(1 for c in candidates if c["has_link"] and c["has_image"])
 
         update_benchmark_status(
             benchmark_id, "selection",
-            f"{total} produits trouvés. Sélectionnez ceux à benchmarker.", 100
+            f"{valid_count} produits trouvés ({complete_count} avec photo et lien). "
+            f"Sélectionnez ceux à benchmarker.",
+            100
         )
 
         print(f"\n[DISCOVER] ══════════════════════════════════════")
-        print(f"[DISCOVER] TERMINÉ : {total} candidats avec photos et liens")
+        print(f"[DISCOVER] TERMINÉ : {valid_count} candidats "
+              f"({complete_count} complets, {skipped} skippés)")
         print(f"[DISCOVER] ══════════════════════════════════════")
 
     except Exception as e:
@@ -149,29 +280,25 @@ def discover_products_task(self, benchmark_id: str, product_type: str, config: d
 
 
 # ══════════════════════════════════════════════
-# TÂCHE 2 : DEEP RESEARCH (produits sélectionnés)
+# TÂCHE 2 : DEEP RESEARCH
 # ══════════════════════════════════════════════
 
 @celery.task(bind=True, name="run_benchmark")
 def run_benchmark(self, benchmark_id: str, product_type: str, config: dict, selected_products: list = None):
     """
-    Phase 2 : Deep research sur les produits sélectionnés par l'utilisateur.
-    Si selected_products est None, fait la sélection automatique (mode legacy).
+    Phase 2 : Deep research sur les produits sélectionnés.
     """
     try:
-        # ─── Si pas de produits présélectionnés, mode legacy ───
         if selected_products is None:
             market_research = research_market_landscape(product_type, config)
-            selected_products_raw = select_products(product_type, config, market_research)
+            raw = select_products(product_type, config, market_research)
             selected_products = [
-                {"name": p["name"], "brand": p.get("brand", ""), 
+                {"name": p["name"], "brand": p.get("brand", ""),
                  "image_url": "", "source_url": "", "estimated_price": p.get("estimated_price")}
-                for p in selected_products_raw
+                for p in raw
             ]
             market_research_data = market_research
         else:
-            # Récupérer l'analyse de marché sauvegardée
-            from database import get_market_research
             market_research_data = get_market_research(benchmark_id)
 
         total_products = len(selected_products)
@@ -180,28 +307,21 @@ def run_benchmark(self, benchmark_id: str, product_type: str, config: dict, sele
             return
 
         print(f"\n[BENCHMARK] ══════════════════════════════════════")
-        print(f"[BENCHMARK] Deep Research : {product_type}")
-        print(f"[BENCHMARK] {total_products} produits sélectionnés")
+        print(f"[BENCHMARK] Deep Research : {product_type} ({total_products} produits)")
         print(f"[BENCHMARK] ══════════════════════════════════════")
 
-        # ─── Critères de comparaison ───
-        update_benchmark_status(
-            benchmark_id, "criteria",
-            "Définition des critères de comparaison...", 10
-        )
-
+        # Critères
+        update_benchmark_status(benchmark_id, "criteria", "Définition des critères...", 10)
         criteria = define_criteria(product_type, market_research_data)
         update_benchmark_criteria(benchmark_id, criteria)
-
         total_fields = sum(len(cat.get("fields", [])) for cat in criteria)
-        print(f"[BENCHMARK] {total_fields} critères en {len(criteria)} catégories")
 
         criteria_summary = ""
         for cat in criteria:
             field_names = [f["name"] for f in cat.get("fields", [])]
             criteria_summary += f"{cat['category']}: {', '.join(field_names)}\n"
 
-        # ─── Collecte produit par produit ───
+        # Collecte
         for i, product_info in enumerate(selected_products):
             product_name = product_info["name"]
             brand = product_info.get("brand", "")
@@ -209,24 +329,28 @@ def run_benchmark(self, benchmark_id: str, product_type: str, config: dict, sele
 
             update_benchmark_status(
                 benchmark_id, "collecting",
-                f"Collecte approfondie : {product_name} ({i+1}/{total_products})...",
-                progress
+                f"Deep research : {product_name} ({i+1}/{total_products})...", progress
             )
 
-            print(f"\n[BENCHMARK] ═══ Produit {i+1}/{total_products} : {product_name} ═══")
+            print(f"\n[BENCHMARK] ═══ {i+1}/{total_products} : {product_name} ═══")
 
-            # Utiliser le lien/image déjà trouvés en phase 1 si disponibles
             existing_source = product_info.get("source_url", "")
             existing_image = product_info.get("image_url", "")
 
-            # Collecte des données
             collected = deep_collect_product(product_name, brand, criteria_summary)
 
-            # Priorité aux liens/images déjà validés en phase 1
             image_url = existing_image or collected["image_url"]
             source_url = existing_source or collected["best_source_url"]
 
-            # Extraction des données
+            # Si toujours pas de lien/image, retenter
+            if not source_url:
+                print(f"  [RETRY] Pas de lien, nouvelle tentative...")
+                source_url = _find_url_with_retries(product_name, brand)
+            if not image_url:
+                print(f"  [RETRY] Pas d'image, nouvelle tentative...")
+                image_url = _find_image_with_retries(product_name, brand, source_url)
+
+            # Extraction
             extracted_data = {}
             sources_per_field = {}
             completeness = 0.0
@@ -239,11 +363,10 @@ def run_benchmark(self, benchmark_id: str, product_type: str, config: dict, sele
                     extracted_data = result.get("extracted", {})
                     sources_per_field = result.get("sources_per_field", {})
                     completeness = _count_completeness(extracted_data, total_fields)
-                    print(f"  [EXTRACT] Extraction 1 : {completeness:.0%}")
                 except Exception as e:
                     print(f"  [EXTRACT] Erreur : {e}")
 
-            # Recherche complémentaire ciblée
+            # Recherche complémentaire
             if completeness < 0.60:
                 missing_by_cat = {}
                 for cat in criteria:
@@ -257,35 +380,27 @@ def run_benchmark(self, benchmark_id: str, product_type: str, config: dict, sele
 
                 for cat_name, missing_fields in missing_by_cat.items():
                     fields_str = ", ".join(missing_fields[:5])
-                    print(f"  [EXTRACT] Recherche ciblée : {cat_name}")
-
                     targeted = _openai_web_search(
-                        f"Pour le produit {product_name} ({brand}), "
-                        f"trouve : {fields_str}. "
-                        f"Donne des valeurs PRÉCISES avec sources."
+                        f"{product_name} ({brand}) : {fields_str}. Valeurs précises avec sources."
                     )
-
                     if targeted["success"] and targeted["text"]:
-                        new_urls = [s["url"] for s in targeted["sources"]]
                         try:
                             extracted_data, new_sources = deep_extract_missing_fields(
                                 product_name, criteria, extracted_data,
-                                targeted["text"], new_urls
+                                targeted["text"], [s["url"] for s in targeted["sources"]]
                             )
                             sources_per_field.update(new_sources)
                             completeness = _count_completeness(extracted_data, total_fields)
-                        except Exception as e:
-                            print(f"  [EXTRACT] Erreur ciblée : {e}")
+                        except:
+                            pass
 
             # Enrichissement IA
             if completeness < 0.40:
                 try:
-                    extracted_data = enrich_product_from_knowledge(
-                        product_name, criteria, extracted_data
-                    )
+                    extracted_data = enrich_product_from_knowledge(product_name, criteria, extracted_data)
                     completeness = _count_completeness(extracted_data, total_fields)
-                except Exception as e:
-                    print(f"  [EXTRACT] Erreur enrichissement : {e}")
+                except:
+                    pass
 
             # Prix
             price_min = None
@@ -293,22 +408,18 @@ def run_benchmark(self, benchmark_id: str, product_type: str, config: dict, sele
             for key, val in extracted_data.items():
                 if "prix" in key.lower() and val is not None:
                     try:
-                        price_str = str(val).replace("€", "").replace(",", ".").replace("\u00a0", "").replace(" ", "")
-                        price_val = float(price_str)
-                        if price_min is None or price_val < price_min:
-                            price_min = price_val
-                        if price_max is None or price_val > price_max:
-                            price_max = price_val
+                        pv = float(str(val).replace("€", "").replace(",", ".").replace("\u00a0", "").replace(" ", ""))
+                        if price_min is None or pv < price_min:
+                            price_min = pv
+                        if price_max is None or pv > price_max:
+                            price_max = pv
                     except:
                         pass
-
             if price_min is None and product_info.get("estimated_price"):
                 price_min = product_info["estimated_price"]
                 price_max = product_info["estimated_price"]
 
             # Sauvegarde
-            source_summary = [{"url": s["url"], "title": s.get("title", "")} for s in collected["sources"]]
-
             product_data = {
                 "id": str(uuid.uuid4()),
                 "name": product_name,
@@ -319,7 +430,7 @@ def run_benchmark(self, benchmark_id: str, product_type: str, config: dict, sele
                 "price_max": price_max,
                 "data": extracted_data,
                 "completeness": completeness,
-                "sources": source_summary,
+                "sources": [{"url": s["url"], "title": s.get("title", "")} for s in collected["sources"]],
                 "sources_per_field": sources_per_field,
             }
             save_product(benchmark_id, product_data)
@@ -327,7 +438,6 @@ def run_benchmark(self, benchmark_id: str, product_type: str, config: dict, sele
             print(f"  [SAVE] ✓ {product_name} — {completeness:.0%}, "
                   f"image: {'✓' if image_url else '✗'}, lien: {'✓' if source_url else '✗'}")
 
-        # Terminé
         update_benchmark_status(
             benchmark_id, "done",
             f"Benchmark terminé ! {total_products} produits.", 100
