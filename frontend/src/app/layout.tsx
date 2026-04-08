@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Benchmark Produits — Comparateur intelligent",
-  description: "Générez automatiquement un tableau comparatif fiable et exhaustif pour n'importe quel type de produit.",
+  title: "PCA — Product Conception Assistant",
+  description: "Benchmark intelligent de produits physiques. Comparez n'importe quel produit avec une analyse approfondie du marché.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
