@@ -10,31 +10,46 @@ const config: Config = {
         mono: ['"JetBrains Mono"', "monospace"],
       },
       colors: {
+        /* Bleu Nuit — PANTONE PQ-288C — couleur principale */
         brand: {
-          50: "#f0f4ff",
-          100: "#dbe4ff",
-          200: "#bac8ff",
-          300: "#91a7ff",
-          400: "#748ffc",
-          500: "#5c7cfa",
-          600: "#4c6ef5",
-          700: "#4263eb",
-          800: "#3b5bdb",
-          900: "#364fc7",
-          950: "#1e3a8a",
+          50: "#e6ecf5",
+          100: "#b3c4de",
+          200: "#809cc7",
+          300: "#4d74b0",
+          400: "#264da0",
+          500: "#002D72",  /* Bleu Nuit exact */
+          600: "#002663",
+          700: "#001F54",
+          800: "#001845",
+          900: "#001136",
+          950: "#000a22",
         },
+        /* Rouge — PANTONE 485 XGC — alertes et CTA */
+        accent: {
+          50: "#fde8e7",
+          100: "#f9bcb8",
+          200: "#f59089",
+          300: "#f1645a",
+          400: "#e8413a",
+          500: "#DA291C",  /* Rouge exact */
+          600: "#c02318",
+          700: "#a01d14",
+          800: "#801710",
+          900: "#60110c",
+        },
+        /* Gris — basé sur Warm Gray Pantone */
         surface: {
-          0: "#ffffff",
-          50: "#f8f9fb",
-          100: "#f1f3f5",
-          200: "#e9ecef",
-          300: "#dee2e6",
-          400: "#ced4da",
-          500: "#adb5bd",
-          600: "#868e96",
-          700: "#495057",
-          800: "#343a40",
-          900: "#212529",
+          0: "#ffffff",     /* Blanc — fond principal */
+          50: "#f7f6f4",    /* Blanc cassé chaud */
+          100: "#edecea",   /* Gris très clair chaud */
+          200: "#D7D2CB",   /* PANTONE Warm Gray 1 C — fonds de cartes */
+          300: "#c4beb6",   /* Gris clair intermédiaire */
+          400: "#B2A89F",   /* PANTONE Warm Gray 3 C — textes secondaires */
+          500: "#978e84",   /* Gris moyen */
+          600: "#7a7169",   /* Gris foncé */
+          700: "#5c544e",   /* Texte secondaire fort */
+          800: "#3e3833",   /* Texte quasi-noir */
+          900: "#1e1b18",   /* Quasi-noir chaud */
         },
       },
     },
